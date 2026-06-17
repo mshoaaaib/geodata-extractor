@@ -1,0 +1,8 @@
+[server]
+maxUploadSize = 50       # MB — raise if processing large files
+
+[theme]
+primaryColor = "#2563EB"
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#F1F5F9"

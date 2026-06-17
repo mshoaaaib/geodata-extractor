@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+geodata_output/
+*.xlsx
+!flood_events_template.xlsx
+side_bar.json

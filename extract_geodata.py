@@ -50,16 +50,17 @@ import requests
 
 try:
     import ee
-    ee.Initialize(project="fleet-furnace-348411")
+    _GEE_PROJECT = os.environ.get("GEE_PROJECT", "fleet-furnace-348411")
+    ee.Initialize(project=_GEE_PROJECT)
     _GEE_AVAILABLE = True
 except Exception as _gee_err:
     _GEE_AVAILABLE = False
     print(f"[GEE] Not available — impervious surface will fall back: {_gee_err}")
 
-# ── API Credentials ───────────────────────────────────────────────────────────
-OPENTOPOGRAPHY_API_KEY    = "4679400254275329b1394869b1885af7"
-SENTINELHUB_CLIENT_ID     = "sh-fe25884a-88a2-4ccd-aae4-5e95127aafdc"
-SENTINELHUB_CLIENT_SECRET = "FvIrIrZkvnz0qpmORzw9EyeSmsCxwAdF"
+# ── API Credentials (set via environment variables or .streamlit/secrets.toml) ─
+OPENTOPOGRAPHY_API_KEY    = os.environ.get("OPENTOPOGRAPHY_API_KEY", "")
+SENTINELHUB_CLIENT_ID     = os.environ.get("SH_CLIENT_ID", "")
+SENTINELHUB_CLIENT_SECRET = os.environ.get("SH_CLIENT_SECRET", "")
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 DEM_DATASET      = "SRTMGL1"

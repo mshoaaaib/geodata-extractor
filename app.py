@@ -29,7 +29,7 @@ def _apply_credentials():
         SH_CLIENT_SECRET = "..."
         GEE_PROJECT      = "..."
     """
-    for key in ("SH_CLIENT_ID", "SH_CLIENT_SECRET", "GEE_PROJECT"):
+    for key in ("SH_CLIENT_ID", "SH_CLIENT_SECRET", "GEE_PROJECT", "OPENTOPOGRAPHY_API_KEY"):
         try:
             val = st.secrets.get(key) or os.environ.get(key)
             if val:

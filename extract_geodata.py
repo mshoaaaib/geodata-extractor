@@ -358,7 +358,7 @@ def extract_terrain_gee(lat: float, lon: float) -> dict:
             for dr, dc in offsets
         ]
         fc      = ee.FeatureCollection(features)
-        dem     = ee.Image("COPERNICUS/DEM/GLO30").select("DEM")
+        dem     = ee.ImageCollection("COPERNICUS/DEM/GLO30").select("DEM").mosaic()
         sampled = dem.sampleRegions(collection=fc, scale=30, geometries=False)
         data    = sampled.getInfo()["features"]
         data.sort(key=lambda f: f["properties"]["idx"])
@@ -1067,6 +1067,8 @@ def extract_row(lat: float, lon: float,
         result.update({k: NAN for k in
                        ("ndvi", "ndbi", "impervious_pct",
                         "population_per_km2", "rainfall_mm")})
+        result.setdefault("soil_texture", "")
+        result.setdefault("lulc_class", "")
         return result
 
     flood_year = flood_date.year
@@ -1143,8 +1145,9 @@ def process_dataframe(
     else:
         log_fn("  WARNING: No date columns found — date-sensitive features will be NaN")
 
+    _STR_COLS = {"soil_texture", "lulc_class"}
     for fc in FEATURE_COLS:
-        df[fc] = NAN
+        df[fc] = "" if fc in _STR_COLS else NAN
 
     failed_rows: list = []
     total = len(df)

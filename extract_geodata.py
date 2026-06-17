@@ -64,12 +64,13 @@ SENTINELHUB_CLIENT_SECRET = os.environ.get("SH_CLIENT_SECRET", "")
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 DEM_DATASET      = "SRTMGL1"
-BBOX_BUFFER      = 0.10      # degrees buffer for OSM queries (~11 km)
+BBOX_BUFFER      = 0.15      # degrees buffer for OSM queries (~16 km)
 SH_BBOX_BUFFER   = 0.02      # degrees buffer for Sentinel Hub NDVI/NDBI (~2 km)
 SH_RES_DEG       = 0.0001    # Sentinel Hub resx/resy in degrees (≈ 11 m); must be
                               # in CRS units (degrees) when bbox CRS is EPSG:4326
 TERRAIN_CELL_M   = 30.0      # grid spacing for finite-difference terrain (≈ SRTM res)
-NDVI_DAYS_BEFORE = 45        # days before Flood_Date to start Sentinel-2 search
+HS_CELL_M        = 90.0      # HydroSHEDS 03-arc-second cell size in metres
+NDVI_DAYS_BEFORE = 60        # days before Flood_Date to start Sentinel-2 search
 MAX_CLOUD_COVER  = 30        # % maximum cloud cover for Sentinel-2
 TWI_CAP          = 20.0      # cap TWI at this value for flat terrain
 
@@ -318,6 +319,100 @@ def extract_terrain(lat: float, lon: float) -> dict:
         "curvature": round(curvature, 7),
         "twi":       round(twi, 4),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1–5  Static Terrain — GEE version (Copernicus DEM GLO30 + HydroSHEDS TWI)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_terrain_gee(lat: float, lon: float) -> dict:
+    """
+    Query a 3×3 elevation grid from Copernicus DEM GLO30 via GEE.
+    GLO30 is TanDEM-X based (±1 m vertical accuracy vs SRTM ±16 m).
+    TWI uses HydroSHEDS 90 m flow accumulation for proper specific
+    catchment area instead of the single-cell local approximation.
+    Falls back to OpenTopoData SRTM if GEE is unavailable or fails.
+    """
+    if not _GEE_AVAILABLE:
+        return extract_terrain(lat, lon)
+
+    try:
+        cm   = TERRAIN_CELL_M
+        dlat = cm / 111_320.0
+        dlon = cm / (111_320.0 * math.cos(math.radians(lat)) + 1e-9)
+
+        offsets = [(-1,-1),(-1, 0),(-1, 1),
+                   ( 0,-1),( 0, 0),( 0, 1),
+                   ( 1,-1),( 1, 0),( 1, 1)]
+
+        features = [
+            ee.Feature(
+                ee.Geometry.Point([lon + dc * dlon, lat + dr * dlat]),
+                {"idx": (dr + 1) * 3 + (dc + 1)}
+            )
+            for dr, dc in offsets
+        ]
+        fc      = ee.FeatureCollection(features)
+        dem     = ee.Image("COPERNICUS/DEM/GLO30").select("DEM")
+        sampled = dem.sampleRegions(collection=fc, scale=30, geometries=False)
+        data    = sampled.getInfo()["features"]
+        data.sort(key=lambda f: f["properties"]["idx"])
+        elevs = [f["properties"]["DEM"] for f in data]
+
+        if len(elevs) < 9:
+            raise ValueError(f"Only {len(elevs)}/9 elevation samples")
+
+        Z    = np.array(elevs, dtype=float).reshape(3, 3)
+        elev = float(Z[1, 1])
+
+        # Horn's finite differences
+        dz_dx = ((Z[0,2]+2*Z[1,2]+Z[2,2]) - (Z[0,0]+2*Z[1,0]+Z[2,0])) / (8 * cm)
+        dz_dy = ((Z[0,0]+2*Z[0,1]+Z[0,2]) - (Z[2,0]+2*Z[2,1]+Z[2,2])) / (8 * cm)
+
+        slope_rad = math.atan(math.sqrt(dz_dx**2 + dz_dy**2))
+        slope_deg = math.degrees(slope_rad)
+
+        aspect_deg = math.degrees(math.atan2(dz_dy, -dz_dx))
+        if aspect_deg < 0:
+            aspect_deg += 360.0
+
+        d2x = (Z[1,0] - 2*Z[1,1] + Z[1,2]) / cm**2
+        d2y = (Z[0,1] - 2*Z[1,1] + Z[2,1]) / cm**2
+        curvature = -(d2x + d2y)
+
+        # TWI with HydroSHEDS flow accumulation
+        # TWI = ln(SCA / tan β)  where SCA = flow_acc_cells × cell_area / cell_width
+        tan_beta = max(math.tan(slope_rad), 0.001)
+        try:
+            fa_img    = ee.Image("WWF/HydroSHEDS/03ACC").select("b1")
+            fa_result = fa_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=ee.Geometry.Point([lon, lat]),
+                scale=90,
+                maxPixels=1,
+            )
+            fa_val = fa_result.get("b1").getInfo()
+            if fa_val and float(fa_val) > 0:
+                sca = float(fa_val) * HS_CELL_M   # cells × cell_size = upslope length (m)
+                twi = min(math.log(sca / tan_beta), TWI_CAP)
+            else:
+                raise ValueError("zero/null flow accumulation")
+        except Exception:
+            twi = min(math.log(cm / tan_beta), TWI_CAP)
+
+        print(f"    [terrain/GLO30] elev={elev:.1f}m  slope={slope_deg:.2f}°  "
+              f"aspect={aspect_deg:.1f}°  curv={curvature:.5f}  twi={twi:.3f}")
+        return {
+            "elevation": round(elev, 2),
+            "slope":     round(slope_deg, 4),
+            "aspect":    round(aspect_deg, 3),
+            "curvature": round(curvature, 7),
+            "twi":       round(twi, 4),
+        }
+
+    except Exception as e:
+        print(f"    [terrain/GLO30] ERROR: {e} — falling back to OpenTopoData SRTM")
+        return extract_terrain(lat, lon)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -722,6 +817,50 @@ def extract_rainfall(lat: float, lon: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 13  Rainfall — GEE CHIRPS version (higher resolution than ERA5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_rainfall_chirps(lat: float, lon: float,
+                            start_date: datetime, end_date: datetime) -> float:
+    """
+    CHIRPS Daily via GEE — ~5.5 km resolution, 1981–present.
+    Significantly finer grain than ERA5 (9 km), especially for
+    localised monsoon events over Pakistan.
+    Falls back to ERA5 via Open-Meteo if GEE unavailable or CHIRPS fails.
+    """
+    if not _GEE_AVAILABLE:
+        return extract_rainfall(lat, lon, start_date, end_date)
+
+    # Start 1 day before flood to capture overnight trigger rainfall
+    d_from     = (start_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    d_to       = end_date.strftime("%Y-%m-%d")
+    d_to_excl  = (end_date + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    try:
+        chirps = (
+            ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
+            .filterDate(d_from, d_to_excl)   # filterDate end is exclusive
+            .select("precipitation")
+            .sum()
+        )
+        result = chirps.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=ee.Geometry.Point([lon, lat]),
+            scale=5566,    # CHIRPS native pixel ~5.5 km
+            maxPixels=1,
+        )
+        total = result.get("precipitation").getInfo()
+        if total is not None:
+            total = round(float(total), 2)
+            print(f"    [Rainfall/CHIRPS] {total:.1f} mm ({d_from} → {d_to})")
+            return total
+        raise ValueError("CHIRPS returned None")
+    except Exception as e:
+        print(f"    [Rainfall/CHIRPS] {e} — falling back to ERA5")
+        return extract_rainfall(lat, lon, start_date, end_date)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-row orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -733,8 +872,10 @@ def extract_row(lat: float, lon: float,
     bbox = bbox_from_point(lat, lon)
 
     # ── Static terrain (5 features) ─────────────────────────────────────────
-    result.update(extract_terrain(lat, lon))
-    time.sleep(1.2)   # OpenTopoData: ~1 req/sec limit
+    # GEE Copernicus GLO30 preferred (±1m); falls back to OpenTopoData SRTM
+    result.update(extract_terrain_gee(lat, lon))
+    if not _GEE_AVAILABLE:
+        time.sleep(1.2)   # OpenTopoData rate limit when GEE unavailable
 
     # ── Distances (3 features) ───────────────────────────────────────────────
     result["dt_river"]    = extract_dt_river(lat, lon, bbox)
@@ -757,7 +898,8 @@ def extract_row(lat: float, lon: float,
     result.update(extract_ndvi_ndbi(lat, lon, flood_date))
     result["impervious_pct"]     = extract_impervious(lat, lon, bbox, flood_year)
     result["population_per_km2"] = extract_population(lat, lon, flood_year)
-    result["rainfall_mm"]        = extract_rainfall(lat, lon, flood_date, eff_end)
+    # CHIRPS (5.5 km) preferred over ERA5 (9 km) for rainfall
+    result["rainfall_mm"]        = extract_rainfall_chirps(lat, lon, flood_date, eff_end)
 
     return result
 

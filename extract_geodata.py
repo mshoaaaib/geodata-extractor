@@ -2,7 +2,7 @@
 """
 GeoData Extractor — Excel Batch Mode
 
-Reads an Excel file with flood event data and extracts 13 geospatial features
+Reads an Excel file with flood event data and extracts 15 geospatial features
 per row, saving results to a new Excel file.
 
 Required columns (case-insensitive):
@@ -28,6 +28,8 @@ Features extracted:
     impervious_pct      — Copernicus HRL (Europe) or built-up estimate via SH
     population_per_km2  — WorldPop ArcGIS ImageServer identify
     rainfall_mm         — Open-Meteo ERA5, cumulative over flood duration
+    soil_texture        — USDA class, OpenLandMap/SoilGrids 250m
+    lulc_class          — ESA WorldCover 2021 (10m) / MODIS MCD12Q1 fallback
 
 Install:
   pip install pandas openpyxl requests numpy
@@ -92,6 +94,7 @@ FEATURE_COLS = [
     "elevation", "slope", "aspect", "curvature", "twi",
     "dt_river", "dt_drainage", "dt_roads",
     "ndvi", "ndbi", "impervious_pct", "population_per_km2", "rainfall_mm",
+    "soil_texture", "lulc_class",
 ]
 
 # Human-readable column headers with units shown in parentheses
@@ -109,6 +112,8 @@ FEATURE_COL_LABELS = {
     "impervious_pct":     "Impervious Surface (%)",
     "population_per_km2": "Population Density (people/km²)",
     "rainfall_mm":        "Cumulative Rainfall (mm)",
+    "soil_texture":       "Soil Texture (USDA class)",
+    "lulc_class":         "Land Use/Land Cover (ESA WorldCover)",
 }
 
 OSM_HEADERS = {"User-Agent": "GeoDataExtractor/1.0 (research)"}
@@ -861,6 +866,173 @@ def extract_rainfall_chirps(lat: float, lon: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 14  Soil Texture
+# ─────────────────────────────────────────────────────────────────────────────
+
+_USDA_TEXTURE = {
+    1: "Clay",  2: "Silty clay",  3: "Silty clay loam",
+    4: "Sandy clay",  5: "Sandy clay loam",  6: "Clay loam",
+    7: "Silt",  8: "Silt loam",  9: "Loam",
+    10: "Sandy loam",  11: "Loamy sand",  12: "Sand",
+}
+
+
+def _usda_class_from_fractions(sand: float, silt: float, clay: float) -> str:
+    """USDA texture triangle classification from sand/silt/clay percentages."""
+    c, si, sa = clay, silt, sand
+    if c >= 40 and si >= 40:   return "Silty clay"
+    if c >= 40 and sa <= 45:   return "Clay"
+    if c >= 35 and sa >= 45:   return "Sandy clay"
+    if c >= 27 and sa <= 20:   return "Silty clay loam"
+    if c >= 27 and sa <= 45:   return "Clay loam"
+    if c >= 20 and sa >= 45:   return "Sandy clay loam"
+    if si >= 80 and c < 12:    return "Silt"
+    if si >= 50 and c < 27:    return "Silt loam"
+    if c >= 7  and sa <= 52:   return "Loam"
+    if sa >= 85:               return "Sand"
+    if sa >= 70:               return "Loamy sand"
+    return "Sandy loam"
+
+
+def extract_soil_texture(lat: float, lon: float) -> str:
+    """
+    USDA soil texture class at 0–5 cm depth.
+    Priority:
+    1. GEE — OpenLandMap SOL_TEXTURE-CLASS_USDA-TT_M v02 (250 m global)
+    2. SoilGrids v2 REST API (250 m) — derives USDA class from sand/silt/clay
+    Returns USDA texture class name string, or '' on failure.
+    """
+    # ── Attempt 1: GEE OpenLandMap ──────────────────────────────────────────
+    if _GEE_AVAILABLE:
+        try:
+            img = ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02").select("b0")
+            result = img.reduceRegion(
+                reducer=ee.Reducer.mode(),
+                geometry=ee.Geometry.Point([lon, lat]).buffer(250),
+                scale=250,
+                maxPixels=100,
+            ).getInfo()
+            code = result.get("b0")
+            if code is not None:
+                label = _USDA_TEXTURE.get(int(round(float(code))),
+                                          f"Class {int(round(float(code)))}")
+                print(f"    [SoilTexture] OpenLandMap → {label} (code {int(round(float(code)))})")
+                return label
+        except Exception as e:
+            print(f"    [SoilTexture] GEE error: {e} — trying SoilGrids REST")
+
+    # ── Attempt 2: SoilGrids v2 REST API ───────────────────────────────────
+    try:
+        r = requests.get(
+            "https://rest.isric.org/soilgrids/v2.0/properties/query",
+            params=[
+                ("lon", lon), ("lat", lat),
+                ("property", "sand"), ("property", "silt"), ("property", "clay"),
+                ("depth", "0-5cm"), ("value", "mean"),
+            ],
+            timeout=25,
+        )
+        r.raise_for_status()
+        fracs: dict = {}
+        for layer in r.json().get("properties", {}).get("layers", []):
+            name = layer.get("name")
+            val  = layer.get("depths", [{}])[0].get("values", {}).get("mean")
+            if name in ("sand", "silt", "clay") and val is not None:
+                fracs[name] = float(val) / 10.0   # g/kg → %
+        if len(fracs) == 3:
+            label = _usda_class_from_fractions(fracs["sand"], fracs["silt"], fracs["clay"])
+            print(f"    [SoilTexture] SoilGrids → {label} "
+                  f"(sand={fracs['sand']:.1f}% silt={fracs['silt']:.1f}% clay={fracs['clay']:.1f}%)")
+            return label
+    except Exception as e:
+        print(f"    [SoilTexture] SoilGrids ERROR: {e}")
+
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 15  Land Use / Land Cover
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ESA_WORLDCOVER = {
+    10: "Tree cover",         20: "Shrubland",
+    30: "Grassland",          40: "Cropland",
+    50: "Built-up",           60: "Bare/sparse vegetation",
+    70: "Snow and ice",       80: "Permanent water bodies",
+    90: "Herbaceous wetland", 95: "Mangroves",
+    100: "Moss and lichen",
+}
+
+_MODIS_IGBP = {
+    1:  "Evergreen needleleaf forest",  2:  "Evergreen broadleaf forest",
+    3:  "Deciduous needleleaf forest",  4:  "Deciduous broadleaf forest",
+    5:  "Mixed forest",                 6:  "Closed shrubland",
+    7:  "Open shrubland",               8:  "Woody savanna",
+    9:  "Savanna",                      10: "Grassland",
+    11: "Permanent wetland",            12: "Cropland",
+    13: "Urban and built-up",           14: "Cropland/natural veg. mosaic",
+    15: "Snow and ice",                 16: "Barren/sparsely vegetated",
+    17: "Water",
+}
+
+
+def extract_lulc(lat: float, lon: float, flood_year: int) -> str:
+    """
+    Land Use / Land Cover classification.
+    Priority:
+    1. GEE — ESA WorldCover v200 2021 (10 m) — best spatial detail
+    2. GEE — MODIS MCD12Q1 IGBP (500 m, year-matched 2001–2022) — temporal match
+    Returns class name string, or '' on failure.
+    """
+    if not _GEE_AVAILABLE:
+        return ""
+
+    # ── Attempt 1: ESA WorldCover 2021 (10 m) ───────────────────────────────
+    try:
+        img = ee.Image("ESA/WorldCover/v200/2021").select("Map")
+        result = img.reduceRegion(
+            reducer=ee.Reducer.mode(),
+            geometry=ee.Geometry.Point([lon, lat]).buffer(50),
+            scale=10,
+            maxPixels=1000,
+        ).getInfo()
+        code = result.get("Map")
+        if code is not None:
+            label = _ESA_WORLDCOVER.get(int(round(float(code))),
+                                        f"Class {int(round(float(code)))}")
+            print(f"    [LULC] ESA WorldCover 2021 → {label} (code {int(round(float(code)))})")
+            return label
+    except Exception as e:
+        print(f"    [LULC] ESA WorldCover error: {e} — trying MODIS")
+
+    # ── Attempt 2: MODIS MCD12Q1 IGBP year-matched (500 m) ──────────────────
+    try:
+        year = max(2001, min(flood_year, 2022))
+        coll = (
+            ee.ImageCollection("MODIS/061/MCD12Q1")
+            .filter(ee.Filter.calendarRange(year, year, "year"))
+            .select("LC_Type1")
+            .first()
+        )
+        result = coll.reduceRegion(
+            reducer=ee.Reducer.mode(),
+            geometry=ee.Geometry.Point([lon, lat]).buffer(500),
+            scale=500,
+            maxPixels=100,
+        ).getInfo()
+        code = result.get("LC_Type1")
+        if code is not None:
+            label = _MODIS_IGBP.get(int(round(float(code))),
+                                    f"Class {int(round(float(code)))}")
+            print(f"    [LULC] MODIS MCD12Q1 {year} → {label} (code {int(round(float(code)))})")
+            return label
+    except Exception as e:
+        print(f"    [LULC] MODIS error: {e}")
+
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-row orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -876,6 +1048,11 @@ def extract_row(lat: float, lon: float,
     result.update(extract_terrain_gee(lat, lon))
     if not _GEE_AVAILABLE:
         time.sleep(1.2)   # OpenTopoData rate limit when GEE unavailable
+
+    # ── Static soil + LULC (GEE; no date required) ───────────────────────────
+    ref_year = flood_date.year if flood_date else 2021
+    result["soil_texture"] = extract_soil_texture(lat, lon)
+    result["lulc_class"]   = extract_lulc(lat, lon, ref_year)
 
     # ── Distances (3 features) ───────────────────────────────────────────────
     result["dt_river"]    = extract_dt_river(lat, lon, bbox)
@@ -914,7 +1091,7 @@ def process_dataframe(
     progress_fn=None,
 ) -> tuple:
     """
-    Extract all 13 geospatial features for every row in *df*.
+    Extract all 15 geospatial features for every row in *df*.
 
     Parameters
     ----------

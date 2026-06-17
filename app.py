@@ -56,7 +56,7 @@ except Exception as e:
 st.title("🌍 GeoData Extractor")
 st.caption(
     "Upload an Excel file with flood event coordinates and dates. "
-    "The tool extracts 13 geospatial features per row and returns "
+    "The tool extracts 15 geospatial features per row and returns "
     "an enriched Excel file."
 )
 
